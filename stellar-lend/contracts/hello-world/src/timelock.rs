@@ -22,6 +22,17 @@ pub enum TimelockDataKey {
     /// Tracks the last proposal-id that satisfied an `update_delay` execution,
     /// so it cannot be reused across multiple direct `update_delay` calls.
     LastDelayProposalId,
+    /// Registered security council address (single member).
+    SecurityCouncil,
+    /// Number of council approvals required to force-cancel a proposal.
+    CouncilThreshold,
+    /// Length of the veto window (seconds before `eta`) during which the
+    /// proposer, admin, or a council member may veto a pending proposal.
+    VetoWindow,
+    /// Marks that `council` approved proposal `id`.
+    CouncilApproval(u64, Address),
+    /// Number of council approvals collected for proposal `id`.
+    CouncilApprovalCount(u64),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +46,14 @@ pub enum TimelockError {
     ProposalAlreadyCancelled,
     /// `initialize_timelock` was called after a delay was already configured.
     AlreadyInitialized,
+    /// The current time is outside the configured veto window.
+    NotInVetoWindow,
+    /// No security council has been configured.
+    CouncilNotConfigured,
+    /// Not enough council approvals have been collected to escape.
+    InsufficientCouncilApprovals,
+    /// A veto was attempted after the proposal was already executed.
+    VetoAfterExecution,
 }
 
 #[contracttype]
@@ -119,6 +138,71 @@ fn set_last_delay_proposal_id(env: &Env, id: u64) {
         .set(&TimelockDataKey::LastDelayProposalId, &id);
 }
 
+fn get_security_council(env: &Env) -> Option<Address> {
+    env.storage()
+        .persistent()
+        .get(&TimelockDataKey::SecurityCouncil)
+}
+
+fn set_security_council_storage(env: &Env, council: &Address) {
+    env.storage()
+        .persistent()
+        .set(&TimelockDataKey::SecurityCouncil, council);
+}
+
+fn get_council_threshold(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&TimelockDataKey::CouncilThreshold)
+        .unwrap_or(0u32)
+}
+
+fn set_council_threshold_storage(env: &Env, threshold: u32) {
+    env.storage()
+        .persistent()
+        .set(&TimelockDataKey::CouncilThreshold, &threshold);
+}
+
+fn get_veto_window(env: &Env) -> u64 {
+    env.storage()
+        .persistent()
+        .get(&TimelockDataKey::VetoWindow)
+        .unwrap_or(0u64)
+}
+
+fn set_veto_window_storage(env: &Env, seconds: u64) {
+    env.storage()
+        .persistent()
+        .set(&TimelockDataKey::VetoWindow, &seconds);
+}
+
+fn has_council_approval(env: &Env, proposal_id: u64, member: &Address) -> bool {
+    env.storage()
+        .persistent()
+        .get::<_, bool>(&TimelockDataKey::CouncilApproval(proposal_id, member.clone()))
+        .unwrap_or(false)
+}
+
+fn set_council_approval(env: &Env, proposal_id: u64, member: &Address) {
+    env.storage().persistent().set(
+        &TimelockDataKey::CouncilApproval(proposal_id, member.clone()),
+        &true,
+    );
+}
+
+fn get_council_approval_count(env: &Env, proposal_id: u64) -> u32 {
+    env.storage()
+        .persistent()
+        .get::<_, u32>(&TimelockDataKey::CouncilApprovalCount(proposal_id))
+        .unwrap_or(0u32)
+}
+
+fn set_council_approval_count(env: &Env, proposal_id: u64, count: u32) {
+    env.storage()
+        .persistent()
+        .set(&TimelockDataKey::CouncilApprovalCount(proposal_id), &count);
+}
+
 // ---------------------------------------------------------------------------
 // Event emission
 // ---------------------------------------------------------------------------
@@ -132,6 +216,11 @@ mod topic {
     pub const EXECUTED: &str = "executed";
     pub const CANCELLED: &str = "cancelled";
     pub const DELAY_UPDATED: &str = "delay_updated";
+    pub const VETOED: &str = "vetoed";
+    pub const COUNCIL_ESCAPE: &str = "council_escape";
+    pub const COUNCIL_APPROVED: &str = "council_approved";
+    pub const COUNCIL_CONFIGURED: &str = "council_configured";
+    pub const VETO_WINDOW_UPDATED: &str = "veto_window_updated";
 }
 
 fn emit_initialized(env: &Env, delay: u64) {
@@ -182,6 +271,56 @@ fn emit_delay_updated(env: &Env, old_delay: u64, new_delay: u64, via_proposal_id
             Symbol::new(env, topic::DELAY_UPDATED),
         ),
         (old_delay, new_delay, via_proposal_id.unwrap_or(u64::MAX)),
+    );
+}
+
+fn emit_vetoed(env: &Env, id: u64, caller: &Address) {
+    env.events().publish(
+        (
+            Symbol::new(env, topic::MODULE),
+            Symbol::new(env, topic::VETOED),
+        ),
+        (id, caller.clone()),
+    );
+}
+
+fn emit_council_escape(env: &Env, id: u64, approvers: &Vec<Address>) {
+    env.events().publish(
+        (
+            Symbol::new(env, topic::MODULE),
+            Symbol::new(env, topic::COUNCIL_ESCAPE),
+        ),
+        (id, approvers.clone()),
+    );
+}
+
+fn emit_council_approved(env: &Env, id: u64, member: &Address, count: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, topic::MODULE),
+            Symbol::new(env, topic::COUNCIL_APPROVED),
+        ),
+        (id, member.clone(), count),
+    );
+}
+
+fn emit_council_configured(env: &Env, council: &Address, threshold: u32) {
+    env.events().publish(
+        (
+            Symbol::new(env, topic::MODULE),
+            Symbol::new(env, topic::COUNCIL_CONFIGURED),
+        ),
+        (council.clone(), threshold),
+    );
+}
+
+fn emit_veto_window_updated(env: &Env, seconds: u64) {
+    env.events().publish(
+        (
+            Symbol::new(env, topic::MODULE),
+            Symbol::new(env, topic::VETO_WINDOW_UPDATED),
+        ),
+        seconds,
     );
 }
 
@@ -306,6 +445,133 @@ pub fn cancel_proposal(env: &Env, caller: &Address, proposal_id: u64) -> Result<
 /// Read proposal details by id.
 pub fn get_proposal(env: &Env, proposal_id: u64) -> Result<TimelockProposal, TimelockError> {
     load_proposal(env, proposal_id).ok_or(TimelockError::ProposalNotFound)
+}
+
+/// Register the security council address and the number of approvals required
+/// to force-cancel a proposal via [`council_escape`]. Only the admin can call.
+pub fn set_security_council(
+    env: &Env,
+    admin: &Address,
+    council: Address,
+    threshold: u32,
+) -> Result<(), TimelockError> {
+    require_admin(env, admin).map_err(|_| TimelockError::Unauthorized)?;
+
+    if threshold == 0 {
+        return Err(TimelockError::InsufficientCouncilApprovals);
+    }
+
+    set_security_council_storage(env, &council);
+    set_council_threshold_storage(env, threshold);
+    emit_council_configured(env, &council, threshold);
+    Ok(())
+}
+
+/// Configure the veto window (seconds before `eta`) during which a pending
+/// proposal may be vetoed. Only the admin can call.
+pub fn set_veto_window(env: &Env, admin: &Address, seconds: u64) -> Result<(), TimelockError> {
+    require_admin(env, admin).map_err(|_| TimelockError::Unauthorized)?;
+    set_veto_window_storage(env, seconds);
+    emit_veto_window_updated(env, seconds);
+    Ok(())
+}
+
+/// Veto a pending proposal. Callable by the proposer, the admin, or a
+/// registered security council member, and only while `now < eta`.
+///
+/// # Security
+/// - Rejects with [`TimelockError::VetoAfterExecution`] if the proposal has
+///   already been executed.
+/// - Rejects with [`TimelockError::NotInVetoWindow`] if `now >= eta`.
+pub fn veto_proposal(env: &Env, caller: &Address, proposal_id: u64) -> Result<(), TimelockError> {
+    let mut proposal = load_proposal(env, proposal_id).ok_or(TimelockError::ProposalNotFound)?;
+
+    match proposal.status {
+        ProposalStatus::Executed => return Err(TimelockError::VetoAfterExecution),
+        ProposalStatus::Cancelled => return Err(TimelockError::ProposalAlreadyCancelled),
+        ProposalStatus::Pending => {}
+    }
+
+    // Authorization: proposer, admin, or registered council member.
+    let is_proposer = proposal.proposer == *caller;
+    let is_admin = require_admin(env, caller).is_ok();
+    let is_council = get_security_council(env)
+        .map(|c| c == *caller)
+        .unwrap_or(false);
+
+    if !is_proposer && !is_admin && !is_council {
+        return Err(TimelockError::Unauthorized);
+    }
+
+    let now = env.ledger().timestamp();
+    if now >= proposal.eta {
+        return Err(TimelockError::NotInVetoWindow);
+    }
+
+    proposal.status = ProposalStatus::Cancelled;
+    store_proposal(env, &proposal);
+    emit_vetoed(env, proposal_id, caller);
+    Ok(())
+}
+
+/// Record a security council member's approval for a proposal. Only the
+/// registered council member may approve.
+pub fn council_approve(
+    env: &Env,
+    caller: &Address,
+    proposal_id: u64,
+) -> Result<u32, TimelockError> {
+    let council = get_security_council(env).ok_or(TimelockError::CouncilNotConfigured)?;
+    if council != *caller {
+        return Err(TimelockError::Unauthorized);
+    }
+
+    let proposal = load_proposal(env, proposal_id).ok_or(TimelockError::ProposalNotFound)?;
+    match proposal.status {
+        ProposalStatus::Executed => return Err(TimelockError::ProposalAlreadyExecuted),
+        ProposalStatus::Cancelled => return Err(TimelockError::ProposalAlreadyCancelled),
+        ProposalStatus::Pending => {}
+    }
+
+    if !has_council_approval(env, proposal_id, caller) {
+        set_council_approval(env, proposal_id, caller);
+        let count = get_council_approval_count(env, proposal_id) + 1;
+        set_council_approval_count(env, proposal_id, count);
+        emit_council_approved(env, proposal_id, caller, count);
+        Ok(count)
+    } else {
+        Ok(get_council_approval_count(env, proposal_id))
+    }
+}
+
+/// Force-cancel a pending proposal once the security council has collected
+/// enough approvals, regardless of `eta`. Emits `('timelock','council_escape')`.
+pub fn council_escape(env: &Env, caller: &Address, proposal_id: u64) -> Result<(), TimelockError> {
+    let council = get_security_council(env).ok_or(TimelockError::CouncilNotConfigured)?;
+    if council != *caller {
+        return Err(TimelockError::Unauthorized);
+    }
+
+    let mut proposal = load_proposal(env, proposal_id).ok_or(TimelockError::ProposalNotFound)?;
+    match proposal.status {
+        ProposalStatus::Executed => return Err(TimelockError::ProposalAlreadyExecuted),
+        ProposalStatus::Cancelled => return Err(TimelockError::ProposalAlreadyCancelled),
+        ProposalStatus::Pending => {}
+    }
+
+    let threshold = get_council_threshold(env);
+    let count = get_council_approval_count(env, proposal_id);
+    if count < threshold {
+        return Err(TimelockError::InsufficientCouncilApprovals);
+    }
+
+    proposal.status = ProposalStatus::Cancelled;
+    store_proposal(env, &proposal);
+
+    let mut approvers: Vec<Address> = Vec::new(env);
+    approvers.push_back(council.clone());
+    emit_council_escape(env, proposal_id, &approvers);
+    Ok(())
 }
 
 /// Update the timelock delay.
@@ -852,5 +1118,111 @@ mod tests {
         });
         let result = execute_proposal(&env, &admin, id);
         assert_eq!(result, Err(TimelockError::ProposalAlreadyCancelled));
+    }
+
+    // -----------------------------------------------------------------------
+    // veto_proposal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_veto_proposal_by_proposer() {
+        let (env, admin) = setup_initialized(86400);
+        let id = propose(&env, &admin, Symbol::new(&env, "action"), Vec::new(&env)).unwrap();
+        veto_proposal(&env, &admin, id).unwrap();
+        let p = get_proposal(&env, id).unwrap();
+        assert_eq!(p.status, ProposalStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_veto_proposal_unauthorized() {
+        let (env, admin) = setup_initialized(86400);
+        let id = propose(&env, &admin, Symbol::new(&env, "action"), Vec::new(&env)).unwrap();
+        let rando = Address::generate(&env);
+        let result = veto_proposal(&env, &rando, id);
+        assert_eq!(result, Err(TimelockError::Unauthorized));
+    }
+
+    #[test]
+    fn test_veto_proposal_after_execution_rejected() {
+        let (env, admin) = setup_initialized(86400);
+        let id = propose(&env, &admin, Symbol::new(&env, "action"), Vec::new(&env)).unwrap();
+        env.ledger().with_mut(|li| {
+            li.timestamp += 86400 + 1;
+        });
+        execute_proposal(&env, &admin, id).unwrap();
+        let result = veto_proposal(&env, &admin, id);
+        assert_eq!(result, Err(TimelockError::VetoAfterExecution));
+    }
+
+    #[test]
+    fn test_veto_proposal_outside_window_rejected() {
+        let (env, admin) = setup_initialized(86400);
+        let id = propose(&env, &admin, Symbol::new(&env, "action"), Vec::new(&env)).unwrap();
+        env.ledger().with_mut(|li| {
+            li.timestamp += 86400;
+        });
+        let result = veto_proposal(&env, &admin, id);
+        assert_eq!(result, Err(TimelockError::NotInVetoWindow));
+    }
+
+    // -----------------------------------------------------------------------
+    // council_escape
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_council_escape_with_sufficient_approvals() {
+        let (env, admin) = setup_initialized(86400);
+        let council = Address::generate(&env);
+        set_security_council(&env, &admin, council.clone(), 1).unwrap();
+
+        let id = propose(&env, &admin, Symbol::new(&env, "action"), Vec::new(&env)).unwrap();
+
+        // Council approves.
+        let count = council_approve(&env, &council, id).unwrap();
+        assert_eq!(count, 1);
+
+        // Escape succeeds regardless of eta.
+        council_escape(&env, &council, id).unwrap();
+        let p = get_proposal(&env, id).unwrap();
+        assert_eq!(p.status, ProposalStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_council_escape_insufficient_approvals() {
+        let (env, admin) = setup_initialized(86400);
+        let council = Address::generate(&env);
+        set_security_council(&env, &admin, council.clone(), 2).unwrap();
+
+        let id = propose(&env, &admin, Symbol::new(&env, "action"), Vec::new(&env)).unwrap();
+
+        // Only one approval collected, threshold is 2.
+        council_approve(&env, &council, id).unwrap();
+        let result = council_escape(&env, &council, id);
+        assert_eq!(result, Err(TimelockError::InsufficientCouncilApprovals));
+    }
+
+    #[test]
+    fn test_council_escape_not_configured() {
+        let (env, admin) = setup_initialized(86400);
+        let id = propose(&env, &admin, Symbol::new(&env, "action"), Vec::new(&env)).unwrap();
+        let rando = Address::generate(&env);
+        let result = council_escape(&env, &rando, id);
+        assert_eq!(result, Err(TimelockError::CouncilNotConfigured));
+    }
+
+    #[test]
+    fn test_set_security_council_unauthorized() {
+        let (env, _admin) = setup();
+        let rando = Address::generate(&env);
+        let council = Address::generate(&env);
+        let result = set_security_council(&env, &rando, council, 1);
+        assert_eq!(result, Err(TimelockError::Unauthorized));
+    }
+
+    #[test]
+    fn test_set_veto_window() {
+        let (env, admin) = setup();
+        set_veto_window(&env, &admin, 3600).unwrap();
+        assert_eq!(get_veto_window(&env), 3600);
     }
 }

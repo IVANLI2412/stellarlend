@@ -91,8 +91,81 @@ the voting period, quorum and threshold it was created under.
 6. **Threshold**: `for >= (for + against + abstain) * voting_threshold / 10_000` and `for > against`, so a tie never passes. A proposer may raise `voting_threshold` above the default, never lower it.
 7. **Execution delay**: `execute` rejects while `now < eta` (`ExecutionTooEarly`), where `eta = queue time + execution_delay`.
 8. **Grace period**: a proposal must be queued within `timelock_duration` of `end_time`, and executed within `timelock_duration` of eta, or it expires.
-9. **Veto window**: the proposer, admin, or any guardian can cancel a proposal until it executes, including while it is queued.
+9. **Veto window**: the proposer, admin, or any guardian can cancel a proposal until it executes, including while it is queued. See [Timelock Veto Window](#timelock-veto-window) for the exact semantics and the security-council escape path.
 10. **Emergency proposals** skip voting and the delay. Each needs approvals (`gov_approve_proposal`) from the multisig threshold of current multisig admins, and a multisig admin must execute it.
+
+## Timelock Veto Window
+
+Once a proposal is `Queued` it sits in the timelock until its eta
+(`queue time + execution_delay`). During that window the proposal can still be
+stopped by a veto; after it executes the veto is no longer possible.
+
+### Who may veto
+
+| Actor | Entrypoint | Notes |
+|-------|-----------|-------|
+| Proposer | `gov_cancel_proposal` | Always allowed while `Pending`/`Active`/`Queued` |
+| Governance admin | `gov_cancel_proposal` | Always allowed while `Pending`/`Active`/`Queued` |
+| Guardian | `gov_cancel_proposal` | Registered via `gov_add_guardian` |
+| Security council | `gov_council_escape` | Escape hatch, see below |
+
+A veto moves the proposal to `Cancelled` (terminal). Vetoing an `Executed`,
+`Expired` or already `Cancelled` proposal reverts with `ProposalNotCancellable`.
+
+### Security-council escape
+
+The security council is the last line of defence when the normal veto path is
+unavailable (for example the admin key is compromised or the proposer is the
+attacker). It is a distinct role from guardians and is configured with
+`gov_set_security_council(council, threshold)`.
+
+- `threshold` is the number of council members that must approve an escape
+  before it can be applied; it must be `>= 1` and `<=` the number of registered
+  council members.
+- Members approve with `gov_council_approve(proposal_id, member)`. Each member
+  counts once; a duplicate approval reverts with `AlreadyApproved`.
+- Once `threshold` approvals are collected, any council member calls
+  `gov_council_escape(proposal_id, member)` to cancel the proposal immediately,
+  bypassing the remaining timelock delay. The escape is only valid while the
+  proposal is `Queued` (or `Active`); it cannot resurrect an `Executed` or
+  `Expired` proposal.
+- The escape does **not** skip the grace period check for execution: it only
+  cancels. To push a replacement proposal, create and queue a new one through
+  the normal lifecycle.
+
+### Events
+
+| Event | Topics | Emitted when |
+|-------|--------|--------------|
+| `timelock` | `(proposal_id,)` | A proposal enters the timelock (`gov_queue_proposal` succeeds) |
+| `vetoed` | `(proposal_id, actor)` | A proposal is cancelled by proposer, admin or guardian |
+| `timelock` | `(proposal_id, eta)` | The timelock eta is (re)confirmed on read/queue |
+| `council_escape` | `(proposal_id, member)` | The security council applies an escape cancellation |
+
+Consumers should treat `vetoed` and `council_escape` as terminal-cancel signals
+and stop tracking the proposal for execution.
+
+### Operational runbook: emergency cancellation
+
+1. **Confirm the target.** Read `gov_get_proposal_state(id)`; it must be
+   `Active` or `Queued`. If it is already `Executed` or `Expired`, stop — the
+   escape cannot help.
+2. **Assess the normal path.** If the admin or a guardian key is healthy, use
+   `gov_cancel_proposal(id, actor)` and skip the council. The council escape is
+   for when those keys are unavailable or untrusted.
+3. **Collect approvals.** Have each council member submit
+   `gov_council_approve(id, member)` until the configured `threshold` is met.
+   Watch for `council_escape`-adjacent `approval` events to confirm progress.
+4. **Apply the escape.** Any council member calls `gov_council_escape(id, member)`.
+   On success a `council_escape` event is emitted and the proposal is
+   `Cancelled`.
+5. **Verify.** Re-read `gov_get_proposal_state(id)`; it must be `Cancelled`.
+   Confirm the `council_escape` event in the transaction trace.
+6. **Follow up.** Rotate any compromised admin/guardian keys, then re-submit the
+   proposal (or a corrected version) through `gov_create_proposal` and the normal
+   queue/execute path. Record the incident and the escape transaction hash in the
+   governance runbook log.
+=======
 
 ## Entrypoints (all under `#[contractimpl]`)
 
@@ -109,6 +182,9 @@ the voting period, quorum and threshold it was created under.
 | `gov_queue_proposal` | Tally after voting ends → `Queued` or `Defeated` |
 | `gov_execute_proposal` | Apply a queued proposal after the delay, within the grace period |
 | `gov_cancel_proposal` | Cancel / veto by proposer, admin or guardian |
+| `gov_set_security_council` | Configure the security council and its approval threshold |
+| `gov_council_approve` | Council member approves an escape cancellation |
+| `gov_council_escape` | Apply a council escape cancellation (bypasses remaining delay) |
 | `gov_get_proposal` / `gov_get_proposal_state` | Stored proposal / current lifecycle state |
 | `gov_get_config` | Read current config |
 | `gov_create_emergency_proposal` / `gov_approve_proposal` | Multisig emergency path |
@@ -124,6 +200,8 @@ the voting period, quorum and threshold it was created under.
 - Queue gating (before voting ends), success → `Queued`, failure → `Defeated`
 - Execute gating (before delay → 409; after delay → `Executed`; past timelock → 410/`Expired`)
 - Cancel by proposer; cancel of executed proposal rejected
+- Timelock veto window: guardian/admin veto while `Queued`, `vetoed` event emitted
+- Security-council escape: threshold enforcement, duplicate-approval rejection, `council_escape` event, escape of an `Executed` proposal rejected
 - End-to-end happy path with event trace
 
 Run:
@@ -144,6 +222,8 @@ npx jest --runInBand --forceExit governance.e2e.test.ts
 - `gov_queue_proposal`
 - `gov_execute_proposal`
 - `gov_cancel_proposal`
+- `gov_council_approve`
+- `gov_council_escape`
 - `gov_get_proposal`
 - `gov_get_governance_config`
 

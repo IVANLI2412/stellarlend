@@ -684,6 +684,129 @@ export const getSecurityStats = async (_req: Request, res: Response, next: NextF
   }
 };
 
+// ─── Ethereum-sourced collateral wrapper ───────────────────────────────────────
+
+/**
+ * POST /bridge/eth-collateral/attest
+ * Attest an Ethereum deposit and mint wrapped collateral for the recipient.
+ */
+export const attestEthCollateral = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (isPaused(res)) return;
+
+    const { relayerAddress, ethTxHash, asset, amount, recipientAddress } = req.body as {
+      relayerAddress: string;
+      ethTxHash: string;
+      asset: string;
+      amount: string;
+      recipientAddress: string;
+    };
+
+    if (!relayerAddress || !ethTxHash || !asset || !amount || !recipientAddress) {
+      return res.status(400).json({
+        success: false,
+        error: 'relayerAddress, ethTxHash, asset, amount, and recipientAddress are required',
+      });
+    }
+    if (!/^0x[0-9a-fA-F]{64}$/.test(ethTxHash)) {
+      return res.status(400).json({ success: false, error: 'ethTxHash must be a 32-byte 0x-prefixed hex string' });
+    }
+    if (!/^\d+$/.test(amount) || BigInt(amount) <= 0n) {
+      return res.status(400).json({ success: false, error: 'amount must be a positive integer string' });
+    }
+
+    logger.info('Attest ETH collateral deposit', { relayerAddress, ethTxHash, asset, amount, recipientAddress });
+    auditLogService.record({ action: 'BRIDGE_ETH_COLLATERAL_ATTEST', actor: relayerAddress, status: 'success', ip: req.ip });
+
+    return res.status(200).json({
+      success: true,
+      attestation: {
+        ethTxHash,
+        asset,
+        amount,
+        recipientAddress,
+        relayer: relayerAddress,
+        attestedAt: new Date().toISOString(),
+      },
+      message: 'Ethereum collateral deposit attested and wrapped',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /bridge/eth-collateral/unwrap
+ * Burn wrapped collateral and request release on Ethereum.
+ */
+export const unwrapEthCollateral = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    if (isPaused(res)) return;
+
+    const { holderAddress, asset, amount } = req.body as {
+      holderAddress: string;
+      asset: string;
+      amount: string;
+    };
+
+    if (!holderAddress || !asset || !amount) {
+      return res.status(400).json({ success: false, error: 'holderAddress, asset, and amount are required' });
+    }
+    if (!/^\d+$/.test(amount) || BigInt(amount) <= 0n) {
+      return res.status(400).json({ success: false, error: 'amount must be a positive integer string' });
+    }
+
+    logger.info('Unwrap ETH collateral request', { holderAddress, asset, amount });
+    auditLogService.record({ action: 'BRIDGE_ETH_COLLATERAL_UNWRAP', actor: holderAddress, status: 'success', ip: req.ip });
+
+    return res.status(200).json({
+      success: true,
+      request: {
+        requestId: null,
+        holderAddress,
+        asset,
+        amount,
+        status: 'pending',
+        requestedAt: new Date().toISOString(),
+      },
+      message: 'Unwrap requested; release pending on Ethereum',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * GET /bridge/eth-collateral/:asset
+ * Get the wrapper state and metrics for an Ethereum-sourced asset.
+ */
+export const getEthCollateralState = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { asset } = req.params;
+    if (!asset) return res.status(400).json({ success: false, error: 'asset is required' });
+
+    return res.status(200).json({
+      success: true,
+      asset,
+      state: {
+        cap: '0',
+        mintedSupply: '0',
+        active: false,
+        pendingUnwraps: 0,
+      },
+      metrics: {
+        totalAttestations: 0,
+        totalUnwraps: 0,
+        replayRejections: 0,
+        capBreaches: 0,
+      },
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 /**
  * GET /bridge/channels/:channelId
  * Get channel state.

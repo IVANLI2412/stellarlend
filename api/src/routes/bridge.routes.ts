@@ -398,6 +398,69 @@ router.get('/lending/stats', bridgeController.getLendingBridgeStats);
  */
 router.get('/security/stats', bridgeController.getSecurityStats);
 
+// ─── Ethereum-sourced collateral wrapper ──────────────────────────────────────
+
+/**
+ * @openapi
+ * /bridge/eth-collateral/attest:
+ *   post:
+ *     summary: Attest an Ethereum-sourced deposit into the collateral wrapper
+ *     description: >
+ *       Validators attest that an Ethereum-side deposit of a wrapped asset has
+ *       been observed and locked. Once the attestation threshold is met the
+ *       wrapper mints the corresponding Stellar-side collateral.
+ *     tags: [Bridge, EthCollateral]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [validatorAddress, asset, ethTxHash, amount]
+ *             properties:
+ *               validatorAddress: { type: string }
+ *               asset: { type: string, example: "ETH" }
+ *               ethTxHash: { type: string }
+ *               amount: { type: string }
+ *               depositorAddress: { type: string }
+ */
+router.post('/eth-collateral/attest', bridgeController.attestEthCollateral);
+
+/**
+ * @openapi
+ * /bridge/eth-collateral/unwrap:
+ *   post:
+ *     summary: Burn wrapped collateral and release the Ethereum-sourced asset
+ *     tags: [Bridge, EthCollateral]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userAddress, asset, amount]
+ *             properties:
+ *               userAddress: { type: string }
+ *               asset: { type: string, example: "ETH" }
+ *               amount: { type: string }
+ *               ethRecipient: { type: string }
+ */
+router.post('/eth-collateral/unwrap', bridgeController.unwrapEthCollateral);
+
+/**
+ * @openapi
+ * /bridge/eth-collateral/state/{asset}:
+ *   get:
+ *     summary: Get wrapper state for an Ethereum-sourced asset
+ *     tags: [Bridge, EthCollateral]
+ *     parameters:
+ *       - in: path
+ *         name: asset
+ *         required: true
+ *         schema: { type: string }
+ */
+router.get('/eth-collateral/state/:asset', bridgeController.getEthCollateralState);
+
 // ─── Channel management ────────────────────────────────────────────────────────
 
 /**

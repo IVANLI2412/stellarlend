@@ -13,6 +13,9 @@ This contract exposes the current public API for the main StellarLend protocol c
 - Treasury: `set_treasury`, `get_treasury`, `get_reserve_balance`, `claim_reserves`, `set_fee_config`, `get_fee_config`
 - Analytics and queries: `get_protocol_stats`, `get_protocol_report`, `get_user_position`, `get_user_report`, `get_recent_activity`, `get_user_asset_collateral`, `get_user_asset_list`, `get_user_total_collateral_value`, `get_health_factor`
 - Asset configuration: `update_asset_config`
+- Bribe market: `bribe_deposit`, `bribe_settle`, `bribe_claim`, `get_bribe_epoch`, `get_bribe_reward`
+- Cross-chain collateral: `register_eth_attestation`, `wrap_eth_collateral`, `unwrap_eth_collateral`, `get_wrapped_collateral`
+- Bulk repayment: `bulk_repay`, `get_bulk_repay_quote`
 
 ---
 
@@ -69,6 +72,117 @@ The contract previously used `safe_math.rs`, a minimal stub whose `checked_div` 
 | `("math", "overflow")` | Overflow or underflow on any operation |
 | `("math", "div_zero")` | Division by zero |
 | `("math", "neg_sqrt")` | Square root of a negative number |
+
+---
+
+## Bribe Market (`src/bribes.rs`)
+
+The bribe market lets anyone pay voters to direct epoch-based gauge emissions. Bribes are
+scoped to a `(gauge, epoch)` pair, so a deposit only ever rewards votes cast in that epoch.
+
+### Lifecycle
+
+1. **Deposit** — `bribe_deposit(caller, gauge, epoch, asset, amount)` transfers `amount` of
+   `asset` from `caller` into the contract and records it against `(gauge, epoch)`. Deposits are
+   only accepted for the current or a future epoch; depositing into a closed epoch returns
+   `BribeError::EpochClosed`. A zero or negative amount returns `BribeError::InvalidAmount`.
+2. **Settle** — `bribe_settle(caller, gauge, epoch)` is permissionless and callable only after the
+   epoch has ended. It snapshots the epoch's total voting power and computes each voter's pro-rata
+   share of every deposited asset. Settling twice returns `BribeError::AlreadySettled`; settling
+   before the epoch ends returns `BribeError::EpochNotEnded`.
+3. **Claim** — `bribe_claim(caller, gauge, epoch, asset)` pays the caller their settled share and
+   zeroes it out. Claiming before settlement returns `BribeError::NotSettled`; claiming twice
+   returns `BribeError::NothingToClaim`.
+
+Read-only helpers: `get_bribe_epoch(gauge, epoch)` returns the epoch's deposit totals and
+settlement status, and `get_bribe_reward(gauge, epoch, voter, asset)` returns a voter's
+unclaimed share.
+
+### Events emitted
+
+| Topics | Payload | Trigger |
+|---|---|---|
+| `("bribe", "deposit")` | `(gauge, epoch, asset, amount)` | `bribe_deposit` |
+| `("bribe", "settled")` | `(gauge, epoch, total_voting_power)` | `bribe_settle` |
+| `("bribe", "claim")` | `(gauge, epoch, asset, voter, amount)` | `bribe_claim` |
+
+Off-chain indexers subscribe to the `bribe` topic prefix to build the reward leaderboard.
+
+---
+
+## Cross-Chain Collateral Wrapper (`contracts/bridges/`)
+
+The bridge wrapper lets assets held on Ethereum be used as collateral on Stellar without
+custodying the underlying token on this chain.
+
+### Flow
+
+1. **Attest** — `register_eth_attestation(admin, eth_tx_hash, holder, asset, amount)` records a
+   signed Ethereum deposit attestation. Only the configured bridge admin may call it; a repeated
+   `eth_tx_hash` returns `BridgeError::AttestationReplayed`, which prevents double-minting from a
+   replayed message. The attestation must be within the configured freshness window or the call
+   returns `BridgeError::StaleAttestation`.
+2. **Wrap** — `wrap_eth_collateral(holder, asset, amount)` mints a 1:1 wrapped representation
+   against a previously registered attestation and credits it to the holder's collateral balance.
+   Wrapping more than the attested amount returns `BridgeError::InsufficientAttestation`.
+3. **Unwrap** — `unwrap_eth_collateral(holder, asset, amount)` burns the wrapped representation and
+   emits a release request that the relayer settles on Ethereum. Unwrapping more than the holder's
+   wrapped balance returns `BridgeError::InsufficientWrappedBalance`.
+
+`get_wrapped_collateral(holder, asset)` returns the holder's current wrapped balance.
+
+### API routes
+
+The bridge service exposes the wrapper over HTTP:
+
+| Method | Route | Description |
+|---|---|---|
+| `POST` | `/bridge/eth-collateral/attestations` | Submit an Ethereum deposit attestation |
+| `GET` | `/bridge/eth-collateral/attestations/:tx_hash` | Fetch a recorded attestation |
+| `POST` | `/bridge/eth-collateral/wrap` | Wrap attested collateral |
+| `POST` | `/bridge/eth-collateral/unwrap` | Request an unwrap and Ethereum release |
+| `GET` | `/bridge/eth-collateral/:holder/:asset` | Read a holder's wrapped balance |
+
+### Events emitted
+
+| Topics | Payload | Trigger |
+|---|---|---|
+| `("bridge", "attested")` | `(eth_tx_hash, holder, asset, amount)` | `register_eth_attestation` |
+| `("bridge", "wrapped")` | `(holder, asset, amount)` | `wrap_eth_collateral` |
+| `("bridge", "unwrap_requested")` | `(holder, asset, amount)` | `unwrap_eth_collateral` |
+
+---
+
+## Bulk Repayment (`src/repay.rs`)
+
+`bulk_repay(caller, payments)` repays several debts in a single transaction. Each entry in
+`payments` names an asset and an amount; the contract settles them in one pass so a user with
+positions across multiple assets pays one base fee instead of one per asset.
+
+### Cross-asset settlement
+
+An entry may repay a debt denominated in a different asset than the one supplied. The contract
+prices the supplied asset through the oracle (`get_price`) and converts it into the debt asset
+before applying the payment. If the oracle has no price for either asset the call returns
+`RepayError::PriceUnavailable`; if the supplied amount is worth less than one unit of the debt
+asset the entry is skipped rather than reverting the whole batch.
+
+### Gas amortisation
+
+The batch charges a single base cost plus a per-entry marginal cost that is strictly smaller than
+the standalone `repay_debt` cost, so larger batches are cheaper per repayment. `get_bulk_repay_quote(payments)`
+returns the expected total cost and the per-entry breakdown without mutating state, letting clients
+size a batch before submitting it. An empty batch returns `RepayError::EmptyBatch`; a batch larger
+than the configured maximum returns `RepayError::BatchTooLarge`.
+
+### Events emitted
+
+| Topics | Payload | Trigger |
+|---|---|---|
+| `("repay", "bulk")` | `(caller, entries, total_repaid, assets)` | `bulk_repay` |
+
+The aggregated `("repay", "bulk")` event is emitted once per batch rather than once per entry, so
+indexers see a single record for the whole repayment.
 
 ---
 

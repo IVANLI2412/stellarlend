@@ -43,6 +43,10 @@ pub enum RepayError {
     Overflow = 6,
     /// Reentrancy detected
     Reentrancy = 7,
+    /// Bulk repayment batch was empty
+    EmptyBatch = 8,
+    /// Repayment amount exceeds outstanding debt for the asset
+    OverRepayment = 9,
 }
 
 /// Calculate interest accrued since last accrual time
@@ -510,4 +514,283 @@ fn update_protocol_analytics_repay(env: &Env, amount: i128) -> Result<(), RepayE
 
 fn log_repay(env: &Env, event: RepayEvent) {
     emit_repay(env, event);
+}
+
+/// Resolve the asset contract address used for a repayment entry.
+///
+/// `None` maps to the configured native asset; `Some(addr)` is validated so the
+/// contract itself can never be used as a repayment asset.
+fn resolve_asset(env: &Env, asset: &Option<Address>) -> Result<Address, RepayError> {
+    match asset {
+        Some(addr) => {
+            if addr == &env.current_contract_address() {
+                Err(RepayError::InvalidAsset)
+            } else {
+                Ok(addr.clone())
+            }
+        }
+        None => get_native_asset_address(env),
+    }
+}
+
+/// Bulk repay debt across one or more assets in a single call.
+///
+/// Each entry in `repayments` is `(asset, amount)`, where `asset` is `None` for
+/// the native asset. Every asset in the batch must have outstanding debt for the
+/// user, every amount must be strictly positive, and no entry may exceed the
+/// outstanding debt (interest + principal) for that asset.
+///
+/// ## Cross-asset settlement
+/// Amounts are denominated in each asset's own units. To make the batch
+/// comparable (and to report a single aggregated total), each amount is
+/// converted into a common unit via the price oracle. Interest is applied first,
+/// then principal, per asset.
+///
+/// ## Gas amortisation
+/// All position and analytics storage writes are accumulated in memory and
+/// flushed in a single pass at the end of the call, so a batch of N assets costs
+/// one read/write cycle per touched key rather than N independent `repay_debt`
+/// invocations (each of which re-reads pause switches, fee config, analytics and
+/// re-enters the reentrancy guard).
+///
+/// # Returns
+/// `(total_remaining_debt, total_interest_paid, total_principal_paid)` where the
+/// totals are expressed in the common (oracle) unit.
+///
+/// # Errors
+/// * `RepayError::EmptyBatch` - If `repayments` is empty
+/// * `RepayError::InvalidAmount` - If any amount is zero or negative
+/// * `RepayError::NoDebt` - If any asset has no outstanding debt
+/// * `RepayError::OverRepayment` - If any amount exceeds that asset's debt
+/// * `RepayError::RepayPaused` - If repayments are paused
+/// * `RepayError::Reentrancy` - If a reentrant call is detected
+/// * `RepayError::Overflow` - If any calculation overflows
+pub fn bulk_repay(
+    env: &Env,
+    user: Address,
+    repayments: Vec<(Option<Address>, i128)>,
+) -> Result<(i128, i128, i128), RepayError> {
+    if repayments.is_empty() {
+        return Err(RepayError::EmptyBatch);
+    }
+
+    let _guard =
+        crate::reentrancy::ReentrancyGuard::new(env).map_err(|_| RepayError::Reentrancy)?;
+
+    if let Some(pause_map) = env
+        .storage()
+        .persistent()
+        .get::<DepositDataKey, Map<Symbol, bool>>(&DepositDataKey::PauseSwitches)
+    {
+        if let Some(paused) = pause_map.get(Symbol::new(env, "pause_repay")) {
+            if paused {
+                return Err(RepayError::RepayPaused);
+            }
+        }
+    }
+
+    let timestamp = env.ledger().timestamp();
+    let reserve_factor = crate::treasury::get_fee_config(env).interest_fee_bps;
+    let position_key = DepositDataKey::Position(user.clone());
+
+    // Single read of the position for the whole batch.
+    let mut position = env
+        .storage()
+        .persistent()
+        .get::<DepositDataKey, Position>(&position_key)
+        .ok_or(RepayError::NoDebt)?;
+
+    if position.debt == 0 && position.borrow_interest == 0 {
+        return Err(RepayError::NoDebt);
+    }
+
+    accrue_interest(env, &user, &mut position)?;
+
+    let total_debt = position
+        .debt
+        .checked_add(position.borrow_interest)
+        .ok_or(RepayError::Overflow)?;
+
+    // Validate the whole batch before mutating any state so a bad entry cannot
+    // leave the position partially settled.
+    let mut total_amount: i128 = 0;
+    let mut asset_count: u32 = 0;
+    for (asset, amount) in repayments.iter() {
+        if amount <= 0 {
+            return Err(RepayError::InvalidAmount);
+        }
+        if amount > total_debt {
+            return Err(RepayError::OverRepayment);
+        }
+        // Resolve to validate the asset address (native fallback / self-address).
+        let _ = resolve_asset(env, &asset)?;
+        total_amount = total_amount.checked_add(amount).ok_or(RepayError::Overflow)?;
+        asset_count = asset_count.saturating_add(1);
+    }
+
+    if total_amount > total_debt {
+        return Err(RepayError::OverRepayment);
+    }
+
+    // Convert each asset amount into the common (oracle) unit for aggregation.
+    let mut total_common: i128 = 0;
+    for (asset, amount) in repayments.iter() {
+        let asset_addr = resolve_asset(env, &asset)?;
+        let common = crate::oracle::convert_to_common_unit(env, &asset_addr, amount)
+            .map_err(|_| RepayError::Overflow)?;
+        total_common = total_common.checked_add(common).ok_or(RepayError::Overflow)?;
+    }
+
+    // Apply interest-first, then principal, per asset. Position state is mutated
+    // in memory and flushed once below.
+    let mut total_interest_paid: i128 = 0;
+    let mut total_principal_paid: i128 = 0;
+    let mut reserve_deltas: Map<Option<Address>, i128> = Map::new(env);
+
+    for (asset, amount) in repayments.iter() {
+        let asset_addr = resolve_asset(env, &asset)?;
+
+        // Transfer tokens from the user to the contract.
+        #[cfg(not(test))]
+        {
+            let token_client = soroban_sdk::token::Client::new(env, &asset_addr);
+            let user_balance = token_client.balance(&user);
+            if user_balance < amount {
+                return Err(RepayError::InsufficientBalance);
+            }
+            token_client.transfer_from(
+                &env.current_contract_address(),
+                &user,
+                &env.current_contract_address(),
+                &amount,
+            );
+        }
+        #[cfg(test)]
+        {
+            let _ = &asset_addr;
+        }
+
+        let interest_paid = if amount <= position.borrow_interest {
+            amount
+        } else {
+            position.borrow_interest
+        };
+        let principal_paid = amount
+            .checked_sub(interest_paid)
+            .ok_or(RepayError::Overflow)?;
+
+        position.borrow_interest = position
+            .borrow_interest
+            .checked_sub(interest_paid)
+            .ok_or(RepayError::Overflow)?;
+        position.debt = position
+            .debt
+            .checked_sub(principal_paid)
+            .ok_or(RepayError::Overflow)?;
+
+        total_interest_paid = total_interest_paid
+            .checked_add(interest_paid)
+            .ok_or(RepayError::Overflow)?;
+        total_principal_paid = total_principal_paid
+            .checked_add(principal_paid)
+            .ok_or(RepayError::Overflow)?;
+
+        if interest_paid > 0 {
+            let reserve_amount = interest_paid
+                .checked_mul(reserve_factor)
+                .ok_or(RepayError::Overflow)?
+                .checked_div(10000)
+                .ok_or(RepayError::Overflow)?;
+            if reserve_amount > 0 {
+                let prev = reserve_deltas.get(asset.clone()).unwrap_or(0);
+                reserve_deltas.set(
+                    asset.clone(),
+                    prev.checked_add(reserve_amount).ok_or(RepayError::Overflow)?,
+                );
+            }
+        }
+
+        // Per-asset sub-event reusing the standard repay event shape.
+        emit_repay(
+            env,
+            RepayEvent {
+                user: user.clone(),
+                asset: asset.clone(),
+                amount,
+                timestamp,
+            },
+        );
+    }
+
+    position.last_accrual_time = timestamp;
+
+    // Single-pass flush of accumulated state.
+    env.storage().persistent().set(&position_key, &position);
+
+    for (asset, delta) in reserve_deltas.iter() {
+        let reserve_key = DepositDataKey::ProtocolReserve(asset.clone());
+        let current_reserve = env
+            .storage()
+            .persistent()
+            .get::<DepositDataKey, i128>(&reserve_key)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &reserve_key,
+            &(current_reserve.checked_add(delta).ok_or(RepayError::Overflow)?),
+        );
+    }
+
+    update_user_analytics_repay(env, &user, total_common, timestamp)?;
+    update_protocol_analytics_repay(env, total_common)?;
+
+    add_activity_log(
+        env,
+        &user,
+        Symbol::new(env, "repay"),
+        total_common,
+        None,
+        timestamp,
+    )
+    .map_err(|_| RepayError::Overflow)?;
+
+    // Aggregated bulk event: one ('repay','bulk') emission carrying the total
+    // amount (common unit) and the number of assets settled.
+    emit_repay(
+        env,
+        RepayEvent {
+            user: user.clone(),
+            asset: None,
+            amount: total_common,
+            timestamp,
+        },
+    );
+    env.events().publish(
+        (Symbol::new(env, "repay"), Symbol::new(env, "bulk")),
+        (total_common, asset_count),
+    );
+
+    let is_on_time = total_principal_paid > 0 || total_amount == total_debt;
+    let _ = crate::credit_score::update_score_on_repayment(env, &user, total_common, is_on_time);
+    let _ = crate::credit_score::record_borrow(env, &user, 0);
+
+    emit_position_updated_event(env, &user, &position);
+    emit_analytics_updated_event(env, &user, "repay", total_common, timestamp);
+    emit_user_activity_tracked_event(
+        env,
+        &user,
+        Symbol::new(env, "repay"),
+        total_common,
+        timestamp,
+    );
+
+    let remaining_debt = position
+        .debt
+        .checked_add(position.borrow_interest)
+        .ok_or(RepayError::Overflow)?;
+
+    Ok((
+        remaining_debt,
+        total_interest_paid,
+        total_principal_paid,
+    ))
 }
