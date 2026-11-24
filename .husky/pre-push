@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# StellarLend pre-push hook — blocks debug println! in staged contract sources.
+# Bypass with: git push --no-verify
+
+. "$(dirname -- "$0")/_/husky.sh"
+
+REPO_ROOT="$(cd "$(dirname -- "$0")/.." && pwd)"
+bash "$REPO_ROOT/scripts/no-println.sh" --staged
