@@ -1,0 +1,95 @@
+name: ADR Validation
+
+on:
+  pull_request:
+    paths:
+      - 'docs/adr/**'
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  validate:
+    name: Validate ADR files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate ADR files
+        id: validate
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          adr_dir = Path('docs/adr')
+          if not adr_dir.exists():
+              print("::error::docs/adr directory does not exist")
+              sys.exit(1)
+
+          errors = []
+          seen_ids = set()
+          pattern = re.compile(r'^(\d{4})-[a-z0-9-]+\.md$')
+
+          for file in sorted(adr_dir.glob('*.md')):
+              if file.name in ('template.md', 'index.md'):
+                  continue
+
+              # Filename pattern
+              m = pattern.match(file.name)
+              if not m:
+                  errors.append(f"{file.name}: filename must match NNNN-kebab-case-title.md")
+                  continue
+
+              adr_id = int(m.group(1))
+              if adr_id in seen_ids:
+                  errors.append(f"{file.name}: duplicate ADR ID {adr_id:04d}")
+              seen_ids.add(adr_id)
+
+              # Required front-matter fields
+              content = file.read_text(encoding='utf-8')
+              required = ['Status:', 'Date:', 'Authors:']
+              for field in required:
+                  if field not in content:
+                      errors.append(f"{file.name}: missing required field '{field}'")
+
+              # Valid status
+              status_match = re.search(r'Status:\s*(Proposed|Accepted|Superseded|Deprecated)', content)
+              if not status_match:
+                  errors.append(f"{file.name}: Status must be one of Proposed, Accepted, Superseded, Deprecated")
+
+              # Date format
+              date_match = re.search(r'Date:\s*(\d{4}-\d{2}-\d{2})', content)
+              if not date_match:
+                  errors.append(f"{file.name}: Date must be YYYY-MM-DD")
+
+          if errors:
+              print("::error::ADR validation failed:")
+              for e in errors:
+                  print(f"  - {e}")
+              sys.exit(1)
+
+          print(f"✓ Validated {len(seen_ids)} ADR(s)")
+          PY
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "ADR validation completed" >> $GITHUB_STEP_SUMMARY
+          if [ ${{ job.status }} == 'success' ]; then
+            echo "✅ All ADR files passed validation" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ ADR validation failed — check logs" >> $GITHUB_STEP_SUMMARY
+          fi
